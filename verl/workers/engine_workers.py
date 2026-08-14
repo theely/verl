@@ -11,9 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import asyncio
 import functools
 import logging
 import os
+import threading
 from contextlib import nullcontext
 from copy import deepcopy
 from functools import partial
@@ -449,6 +451,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         self.actor: TrainingWorker = None
         self.ref: TrainingWorker = None
         self.rollout: BaseRollout = None
+        self._distributed_group_lock = threading.Lock()
         assert self.role in ["actor", "rollout", "ref", "actor_rollout", "actor_rollout_ref"]
         self._is_actor = self.role in ["actor", "actor_rollout", "actor_rollout_ref"]
         self._is_rollout = self.role in ["rollout", "actor_rollout", "actor_rollout_ref"]
@@ -650,7 +653,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @DistProfiler.annotate(color="red", role="actor_update")
     @_with_routing_replay_flag(enabled=True)
     def update_actor(self, data: TensorDict) -> TensorDict:
-        output = self.actor.train_mini_batch(data=data)
+        with self._distributed_group_lock:
+            output = self.actor.train_mini_batch(data=data)
         return output.cpu() if output is not None else None
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
@@ -695,8 +699,15 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # 0. send_weights only for async training with disaggregated trainer and rollout
         if effective_mode != "naive":
-            per_tensor_param, _ = self.actor.engine.get_per_tensor_param()
-            await self.checkpoint_engine.send_weights(per_tensor_param, global_steps=global_steps)
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, self._distributed_group_lock.acquire)
+            try:
+                torch.distributed.barrier()
+                per_tensor_param, _ = self.actor.engine.get_per_tensor_param()
+                await self.checkpoint_engine.send_weights(per_tensor_param, global_steps=global_steps)
+                torch.distributed.barrier()
+            finally:
+                self._distributed_group_lock.release()
             return
 
         set_expandable_segments(False)
